@@ -5,7 +5,12 @@
 -export([start_link/1, stop/1]).
 
 %% Exported for testing
--export([cancel_timer/1, set_ts/2, force_plan/2, get_tokens/1, get_capacity/1]).
+-export([cancel_timer/1,
+         set_ts/2,
+         force_plan/2,
+         get_tokens/1,
+         get_capacity/1,
+         get_history/1]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -60,6 +65,15 @@ set_ts(Limiter, Ts)     -> gen_server:call(Limiter, {set_ts, Ts}).
 force_plan(Limiter, Ts) -> gen_server:call(Limiter, {force_plan, Ts}).
 get_tokens(Limiter)     -> gen_server:call(Limiter, get_tokens).
 get_capacity(Limiter)   -> gen_server:call(Limiter, get_estimated_capacity).
+get_history(Limiter)    ->
+    {ok, Overload, Estimated, Used} = gen_server:call(Limiter, get_history),
+    lists:keysort(
+      1,
+      lists:foldl(fun ({T, E}, Acc) ->
+                          O = proplists:get_value(T, Overload),
+                          U = proplists:get_value(T, Used),
+                          [{T, E, U, O} | Acc]
+                  end, [], Estimated)).
 
 
 %%
@@ -123,13 +137,22 @@ handle_call({set_ts, Ts}, _From, State) ->
     {reply, ok, State#state{current_ts = Ts}};
 
 handle_call({force_plan, NewTs}, _From, State) ->
+    ets:insert(mocked_time, {time, NewTs}),
+    NewTs = edatetime:now2ts(),
     {reply, ok, spawn_workers(plan(State#state{current_ts = NewTs}))};
 
 handle_call(get_tokens, _From, State) ->
     {reply, {ok, State#state.tokens}, State};
 
 handle_call(get_estimated_capacity, _From, State) ->
-    {reply, {ok, State#state.estimated_capacity}, State}.
+    {reply, {ok, State#state.estimated_capacity}, State};
+
+handle_call(get_history, _From, State) ->
+    {reply, {ok,
+             State#state.overload_history,
+             State#state.estimated_capacity,
+             State#state.used_capacity}, State}.
+
 
 
 
@@ -152,8 +175,8 @@ handle_info({{Pid, Ref}, Response},
                 {ok, _} ->
                     UsedUnits = Mod:units(Request, Response),
                     [{T, UsedCapacity} | Rest] = State#state.used_capacity,
-                    error_logger:info_msg("used units ~p, for ~p~n",
-                                          [UsedUnits, Request]),
+                    %%error_logger:info_msg("used units ~p, for ~p~n",
+                    %%                      [UsedUnits, Request]),
 
                     {noreply, State#state{workers = NewWorkers, num_workers = N-1,
                                           used_capacity = [{T, UsedCapacity+UsedUnits} |
@@ -247,9 +270,9 @@ free_tokens(State) ->
 plan(State) ->
     T = State#state.current_ts,
     error_logger:info_msg("planning t=~p~n"
-                          "overload_history=~p~n"
-                          "estimated_capacity=~p~n"
-                          "used_capacity=~p~n",
+                          "overload_history=~w~n"
+                          "estimated_capacity=~w~n"
+                          "used_capacity=~w~n",
                           [T, State#state.overload_history,
                            State#state.estimated_capacity,
                            State#state.used_capacity]),
@@ -265,22 +288,19 @@ plan(State) ->
 
 
 estimate_capacity(State) ->
-    T = State#state.current_ts,
     {PrevT, PrevEstimatedCapacity} = hd(State#state.estimated_capacity),
     {PrevT, PrevUsedCapacity} = hd(State#state.used_capacity),
 
-    case PrevUsedCapacity >= PrevEstimatedCapacity of
-        true ->
+    UsedMoreThanEstimated = PrevUsedCapacity >= PrevEstimatedCapacity,
+    HadOverload = proplists:get_value(PrevT, State#state.overload_history, 0) > 0,
+
+    case {UsedMoreThanEstimated, HadOverload} of
+        {true, false} ->
             {PrevUsedCapacity, State};
-        false ->
-            case proplists:get_value(PrevT, State#state.overload_history, 0) of
-                0 ->
-                    {PrevUsedCapacity * 1.1,
-                     State#state{pid = limiter_pid_controller:clear(State#state.pid, T)}};
-                Errors ->
-                    {NewEstimatedCapacity, NewPid} =
-                        limiter_pid_controller:update(State#state.pid, T, Errors),
-                    {NewEstimatedCapacity,
-                     State#state{pid = NewPid}}
-            end
+        {true, true} ->
+            {PrevUsedCapacity * 0.90, State};
+        {_, true} ->
+            {PrevEstimatedCapacity * 0.90, State};
+        {false, false} ->
+            {PrevUsedCapacity * 1.05, State}
     end.

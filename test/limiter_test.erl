@@ -77,72 +77,67 @@ simulation() ->
     Parent = self(),
 
 
-    Resource = spawn_link(fun () -> resource_loop([100, 100, 100, 100, 100],
+    Resource = spawn_link(fun () -> resource_loop(lists:duplicate(60, 100),
                                                   0, Parent) end),
 
 
     %% 100 clients hammering the resource
     spawn(fun () ->
-                  simulate_clients(25, 10000, {Limiter, Resource, 10, 0,
-                                               10000, 10000}),
+                  simulate_clients(200, 10000, {Limiter, Resource, 10, 0,
+                                                10000, 10000}),
                   Parent ! simulation_done
           end),
 
 
-    receive {Resource, empty} -> ok end,
-    ok = limiter_server:force_plan(Limiter, 1),
-    ok = set_time(1),
-
-    receive {Resource, empty} -> ok end,
-    ok = limiter_server:force_plan(Limiter, 2),
-    ok = set_time(2),
-
-    receive {Resource, empty} -> ok end,
-    ok = limiter_server:force_plan(Limiter, 3),
-    ok = set_time(3),
+    lists:map(fun (T) ->
+                      receive {Resource, empty} -> ok end,
+                      ok = limiter_server:force_plan(Limiter, T)
+                      %%ok = set_time(T)
+              end, lists:seq(1, 60)),
+    %%receive simulation_done -> ok end,
 
 
-    receive simulation_done -> ok end,
+    History = limiter_server:get_history(Limiter),
+    error_logger:info_msg("~p~n", [History]),
     timer:sleep(1000),
     limiter_server:stop(Limiter).
 
 
 simulate_clients(Concurrency, NumRequests, Args) ->
-    MakeClient = fun (_) -> spawn_link(fun () -> client_loop() end) end,
+    Parent = self(),
+    MakeClient = fun (_) ->
+                         spawn_link(
+                           fun () ->
+                                   client_loop(Parent, NumRequests, Args)
+                           end)
+                 end,
     Clients = lists:map(MakeClient, lists:seq(1, Concurrency)),
 
-    [C ! {go, self(), Args} || C <- Clients],
-    simulate_clients_loop(NumRequests, Clients, Args).
+    %%[C ! {go, self(), Args} || C <- Clients],
+    simulate_clients_loop(Clients).
 
 
-simulate_clients_loop(0, Clients, _) ->
-    [C ! die || C <- Clients],
+simulate_clients_loop([]) ->
+    %%[C ! die || C <- Clients],
     error_logger:info_msg("done!~n"),
     ok;
-simulate_clients_loop(NumRequests, Clients, Args) ->
+simulate_clients_loop(Clients) ->
     receive
-        {Pid, _Res} ->
-            Pid ! {go, self(), Args},
-            %%error_logger:info_msg("res: ~p~n", [NumRequests]),
-            simulate_clients_loop(NumRequests-1, Clients, Args);
-        Other ->
-            error_logger:info_msg("got unexpected message: ~p~n", [Other]),
-            throw({unexpected, Other})
+        {Pid, done} ->
+            simulate_clients_loop(lists:delete(Pid, Clients))
     end.
 
 
-client_loop() ->
-    receive
-        {go, From, {Limiter, Resource, UnitsToUse, ResourceSleep,
-                    WaitTimeout, WorkTimeout}} ->
-            Res = limiter:do(Limiter,
-                             {use_resource, Resource, UnitsToUse, ResourceSleep},
-                             WaitTimeout, WorkTimeout),
-            From ! {self(), Res},
-            client_loop();
-        die ->
-            ok
-    end.
+client_loop(Parent, 0, _) ->
+    Parent ! {self(), done},
+    ok;
+client_loop(Parent, N, {Limiter, Resource, UnitsToUse, ResourceSleep,
+                WaitTimeout, WorkTimeout} = Args) ->
+    limiter:do(Limiter,
+               {use_resource, Resource, UnitsToUse, ResourceSleep},
+               WaitTimeout, WorkTimeout),
+    client_loop(Parent, N-1, Args).
+
 
 
 
@@ -158,13 +153,12 @@ resource_loop(UnitSeries, Ts, UnitsLeft, Parent) ->
                 true ->
                     timer:sleep(Sleep),
                     From ! {self(), {ok, {used_capacity, UnitsToUse}}},
-                    error_logger:info_msg("units ~p~n", [NewUnitsLeft]),
+                    %%error_logger:info_msg("units ~p~n", [NewUnitsLeft]),
                     resource_loop(UnitSeries, Ts, NewUnitsLeft, Parent);
                 false ->
                     From ! {self(), {error, overload}},
                     Parent ! {self(), empty},
-                    error_logger:info_msg("wait for refill, units used: ~p~n",
-                                          [UnitsLeft]),
+                    error_logger:info_msg("wait for refill~n"),
                     wait_for_refill(UnitSeries, Ts, Parent)
             end
     end.
@@ -176,9 +170,11 @@ wait_for_refill(UnitSeries, Ts, Parent) ->
 
             case edatetime:now2ts() =:= Ts of
                 true ->
+                    timer:sleep(10),
                     wait_for_refill(UnitSeries, Ts, Parent);
                 false ->
-                    error_logger:info_msg("resource shifting time~n"),
+                    error_logger:info_msg("resource shifting time, new_t=~p~n",
+                                          [edatetime:now2ts()]),
                     case UnitSeries of
                         [Units | Rest] ->
                             resource_loop(Rest, edatetime:now2ts(), Units, Parent);
@@ -188,7 +184,6 @@ wait_for_refill(UnitSeries, Ts, Parent) ->
                     end
             end
     end.
-
 
 
 
