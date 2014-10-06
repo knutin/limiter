@@ -6,7 +6,7 @@ limiter_test_() ->
      fun () -> ok end,
      fun (_) -> ok end,
      [
-      {timeout, 10, ?_test(simulation())}
+      ?_test(simulation())
      ]}.
 
 default_opts() ->
@@ -76,10 +76,13 @@ simulation() ->
     ok = limiter_server:cancel_timer(Limiter),
     Parent = self(),
 
+    %% One entry per second
+    Capacity =
+        lists:duplicate(60, 100) ++
+        lists:duplicate(60, 50) ++
+        lists:duplicate(60, 200),
 
-    Resource = spawn_link(fun () -> resource_loop(lists:duplicate(30, 100) ++
-                                                      lists:duplicate(30, 50),
-                                                  0, Parent) end),
+    Resource = spawn_link(fun () -> resource_loop(Capacity, 0, Parent) end),
 
 
     Do = fun (Units) ->
@@ -89,7 +92,7 @@ simulation() ->
 
     lists:map(fun (T) ->
                       Do(50),
-                      Do(45),
+                      Do(40),
                       Do(randrange(5)),
                       Do(randrange(5)),
                       Do(randrange(5)),
@@ -98,50 +101,13 @@ simulation() ->
                       receive resource_shifting -> ok end,
                       ok = limiter_server:force_plan(Limiter, T)
 
-              end, lists:seq(1, 60)),
+              end, lists:seq(1, length(Capacity))),
 
     History = limiter_server:get_history(Limiter),
     error_logger:info_msg("~p~n", [History]),
     timer:sleep(1000),
-    limiter_server:stop(Limiter).
-
-
-simulate_clients(Concurrency, NumRequests, Args) ->
-    Parent = self(),
-    MakeClient = fun (_) ->
-                         spawn_link(
-                           fun () ->
-                                   client_loop(Parent, NumRequests, Args)
-                           end)
-                 end,
-    Clients = lists:map(MakeClient, lists:seq(1, Concurrency)),
-
-    %%[C ! {go, self(), Args} || C <- Clients],
-    simulate_clients_loop(Clients).
-
-
-simulate_clients_loop([]) ->
-    %%[C ! die || C <- Clients],
-    error_logger:info_msg("done!~n"),
-    ok;
-simulate_clients_loop(Clients) ->
-    receive
-        {Pid, done} ->
-            simulate_clients_loop(lists:delete(Pid, Clients))
-    end.
-
-
-client_loop(Parent, 0, _) ->
-    Parent ! {self(), done},
-    ok;
-client_loop(Parent, N, {Limiter, Resource, UnitsToUse, ResourceSleep,
-                WaitTimeout, WorkTimeout} = Args) ->
-    limiter:do(Limiter,
-               {use_resource, Resource, UnitsToUse, ResourceSleep},
-               WaitTimeout, WorkTimeout),
-    client_loop(Parent, N-1, Args).
-
-
+    ok = limiter_server:stop(Limiter),
+    ok = clear_time_mock().
 
 
 
@@ -159,8 +125,6 @@ resource_loop(UnitSeries, Ts, UnitsLeft, Parent) ->
                         true ->
                             timer:sleep(Sleep),
                             From ! {self(), {ok, {used_capacity, UnitsToUse}}},
-                            error_logger:info_msg("units ~p, used: ~p~n",
-                                                  [NewUnitsLeft, UnitsToUse]),
                             resource_loop(UnitSeries, Ts, NewUnitsLeft, Parent);
                         false ->
                             From ! {self(), {error, overload}},
@@ -174,8 +138,6 @@ resource_loop(UnitSeries, Ts, UnitsLeft, Parent) ->
             end;
         false ->
             Parent ! resource_shifting,
-            error_logger:info_msg("resource shifting time, new_t=~p~n",
-                                  [edatetime:now2ts()]),
             case UnitSeries of
                 [Units | Rest] ->
                     resource_loop(Rest, edatetime:now2ts(), Units, Parent);
@@ -184,30 +146,6 @@ resource_loop(UnitSeries, Ts, UnitsLeft, Parent) ->
                     ok
             end
     end.
-
-wait_for_refill(UnitSeries, Ts, Parent) ->
-    receive
-        {do_work, From, _, _} ->
-            From ! {self(), {error, overload}},
-
-            case edatetime:now2ts() =:= Ts of
-                true ->
-                    timer:sleep(10),
-                    wait_for_refill(UnitSeries, Ts, Parent);
-                false ->
-                    error_logger:info_msg("resource shifting time, new_t=~p~n",
-                                          [edatetime:now2ts()]),
-                    case UnitSeries of
-                        [Units | Rest] ->
-                            resource_loop(Rest, edatetime:now2ts(), Units, Parent);
-                        [] ->
-                            Parent ! resource_done,
-                            ok
-                    end
-            end
-    end.
-
-
 
 %% pid_test() ->
 %%     Empty = limiter_pid_controller:new(1.0, 0.01, 1.0),
@@ -232,6 +170,10 @@ set_time(T) ->
     ets:insert(mocked_time, {time, T}),
     T = edatetime:now2ts(),
     ok.
+
+clear_time_mock() ->
+    ets:delete(mocked_time),
+    meck:unload(edatetime).
 
 randrange(Range) ->
     random:uniform(Range).

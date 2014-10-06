@@ -16,26 +16,32 @@
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
--record(state, {mod,
+-record(state,
+        {mod,
 
-                queue,
-                tokens,
+         queue,
+         tokens,
 
-                workers,
-                num_workers,
-                max_workers,
+         estimated_capacity :: integer(),
+         used_capacity :: integer(),
+         overload :: integer(),
 
-                response_times,
-                predicted_response_time,
-                last_overload,
-                estimated_capacity,
-                used_capacity,
-                pid,
-                overload_history,
+         estimated_capacity_history :: [{edatetime:timestamp(), integer()}],
+         used_capacity_history :: [{edatetime:timestamp(), integer()}],
+         overload_history :: [{edatetime:timestamp(), integer()}],
 
-                plan_timer,
-                current_ts
-               }).
+         pid,
+
+         workers,
+         num_workers,
+         max_workers,
+
+         response_times,
+         predicted_response_time,
+
+         plan_timer,
+         current_ts
+        }).
 
 %%
 %% API
@@ -94,15 +100,19 @@ init([Opts]) ->
     {ok, TRef} = timer:send_interval(1000, self(), plan),
     {ok, #state{mod = Mod,
                 queue = queue:new(),
-                tokens = [{T, InitialCapacity}],
+                tokens = InitialCapacity,
                 workers = [],
                 num_workers = 0,
                 max_workers = MaxConcurrency,
 
-                last_overload = 0,
+                overload = 0,
                 overload_history = [{T, 0}],
-                estimated_capacity = [{T, InitialCapacity}],
-                used_capacity = [{T, 0}],
+                estimated_capacity = InitialCapacity,
+                estimated_capacity_history = [{T, InitialCapacity}],
+                used_capacity = 0,
+                used_capacity_history = [{T, 0}],
+
+
                 pid = limiter_pid_controller:new(P, I, D, T),
 
                 plan_timer = TRef,
@@ -142,14 +152,11 @@ handle_call({force_plan, NewTs}, _From, State) ->
 handle_call(get_tokens, _From, State) ->
     {reply, {ok, State#state.tokens}, State};
 
-handle_call(get_estimated_capacity, _From, State) ->
-    {reply, {ok, State#state.estimated_capacity}, State};
-
 handle_call(get_history, _From, State) ->
     {reply, {ok,
              State#state.overload_history,
-             State#state.estimated_capacity,
-             State#state.used_capacity}, State}.
+             State#state.estimated_capacity_history,
+             State#state.used_capacity_history}, State}.
 
 
 
@@ -161,8 +168,7 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({{Pid, Ref}, Response},
-            #state{workers = Workers, num_workers = N,
-                   mod = Mod, current_ts = T} = State) ->
+            #state{workers = Workers, num_workers = N, mod = Mod} = State) ->
     case lists:keytake({Pid, Ref}, 1, Workers) of
         {value, {{Pid, Ref}, From, Request, _, Timer},
          NewWorkers} ->
@@ -172,21 +178,15 @@ handle_info({{Pid, Ref}, Response},
             case Response of
                 {ok, _} ->
                     UsedUnits = Mod:units(Request, Response),
-                    [{T, UsedCapacity} | Rest] = State#state.used_capacity,
-                    %%error_logger:info_msg("used units ~p, for ~p~n",
-                    %%                      [UsedUnits, Request]),
-
-                    {noreply, State#state{workers = NewWorkers, num_workers = N-1,
-                                          used_capacity = [{T, UsedCapacity+UsedUnits} |
-                                                           Rest]
+                    UsedCapacity = State#state.used_capacity,
+                    {noreply, State#state{workers = NewWorkers,
+                                          num_workers = N-1,
+                                          used_capacity = UsedCapacity+UsedUnits
                                          }};
                 {error, overload} ->
-                    %%error_logger:info_msg("overload for ~p~n",
-                    %%                     [Request]),
-                    [{T, Overload} | OverloadHistory] = State#state.overload_history,
+                    Overload = State#state.overload,
                     {noreply, State#state{workers = NewWorkers, num_workers = N-1,
-                                          overload_history = [{T, Overload+1} |
-                                                              OverloadHistory]}}
+                                          overload = Overload+1}}
             end;
         false ->
             {noreply, State}
@@ -195,8 +195,7 @@ handle_info({{Pid, Ref}, Response},
 handle_info({worker_timeout, {Pid, Ref}},
             #state{workers = Workers, num_workers = N} = State) ->
     case lists:keytake({Pid, Ref}, 1, Workers) of
-        {value, {{Pid, Ref}, From, Request, {WaitTimeout, WorkTimeout}, Timer},
-         NewWorkers} ->
+        {value, {{Pid, Ref}, From, _, _, _}, NewWorkers} ->
             gen_server:reply(From, {error, timeout}),
             {noreply, State#state{workers = NewWorkers, num_workers = N-1}};
         false ->
@@ -224,13 +223,9 @@ code_change(_OldVsn, State, _Extra) ->
 %% Internal functions
 %%
 
-spawn_workers(#state{workers = Workers, num_workers = N,
-                     mod = Mod, queue = Q, current_ts = T} = State) ->
-    %%error_logger:info_msg("current ts: ~p, tokens: ~p~n",
-    %%                      [State#state.current_ts,
-    %%                       State#state.tokens]),
-    [{T, Tokens} | OldTokens] = State#state.tokens,
-    %%error_logger:info_msg("free tokens: ~p~n", [free_tokens(State)]),
+spawn_workers(#state{workers = Workers, num_workers = N, tokens = Tokens,
+                     mod = Mod, queue = Q} = State) ->
+
     case worker_limit(State)
         and not queue:is_empty(Q)
         and free_tokens(State) of
@@ -242,11 +237,11 @@ spawn_workers(#state{workers = Workers, num_workers = N,
                                      Parent ! {{self(), Ref}, Mod:do(Request)}
                              end),
             Timer = erlang:send_after(WorkTimeout, self(), {worker_timeout, {Pid, Ref}}),
-            spawn_workers(
-              State#state{workers = [{{Pid, Ref}, From, Request,
-                                      {WaitTimeout, WorkTimeout}, Timer} | Workers],
-                          tokens = [{T, Tokens-1} | OldTokens],
-                          num_workers = N+1, queue = NewQ});
+            Worker = {{Pid, Ref}, From, Request, {WaitTimeout, WorkTimeout},
+                      Timer},
+            spawn_workers(State#state{workers = [Worker | Workers],
+                                      tokens = Tokens-1,
+                                      num_workers = N+1, queue = NewQ});
         false ->
             State
     end.
@@ -259,46 +254,46 @@ enough_time(WaitStart, WaitTimeout, PredictedResponseTime) ->
 
 
 free_tokens(State) ->
-    %%error_logger:info_msg("tokens: ~p~n",
-    %%                      [proplists:get_value(State#state.current_ts,
-    %%                                           State#state.tokens, 0.0)]),
-    proplists:get_value(State#state.current_ts, State#state.tokens, 0.0) > 0.0.
+    State#state.tokens > 0.
 
 
 plan(State) ->
     T = State#state.current_ts,
-    error_logger:info_msg("planning t=~p~n"
-                          "overload_history=~w~n"
-                          "estimated_capacity=~w~n"
-                          "used_capacity=~w~n",
-                          [T, State#state.overload_history,
-                           State#state.estimated_capacity,
-                           State#state.used_capacity]),
+    %% error_logger:info_msg("planning t=~p~n"
+    %%                       "overload_history=~w~n"
+    %%                       "estimated_capacity=~w~n"
+    %%                       "used_capacity=~w~n",
+    %%                       [T, State#state.overload_history,
+    %%                        State#state.estimated_capacity,
+    %%                        State#state.used_capacity]),
 
-    {NewEstimatedCapacity, NewState} = estimate_capacity(State),
-    error_logger:info_msg("new estimate: ~p~n", [NewEstimatedCapacity]),
+    Estimate = trunc(estimate_capacity(State)),
+    %%error_logger:info_msg("new estimate: ~p~n", [NewEstimatedCapacity]),
 
-    NewState#state{tokens = [{T, trunc(NewEstimatedCapacity)} | State#state.tokens],
-                   estimated_capacity = [{T, trunc(NewEstimatedCapacity)} |
-                                         State#state.estimated_capacity],
-                   used_capacity = [{T, 0} | State#state.used_capacity],
-                   overload_history = [{T, 0} | State#state.overload_history]}.
+
+    State#state{tokens = Estimate,
+                estimated_capacity = Estimate,
+                used_capacity = 0,
+                overload = 0,
+
+                estimated_capacity_history = [{T, Estimate} |
+                                              State#state.estimated_capacity_history],
+                used_capacity_history = [{T, State#state.used_capacity} |
+                                         State#state.used_capacity_history],
+                overload_history = [{T, State#state.overload} |
+                                    State#state.overload_history]}.
 
 
 estimate_capacity(State) ->
-    {PrevT, PrevEstimatedCapacity} = hd(State#state.estimated_capacity),
-    {PrevT, PrevUsedCapacity} = hd(State#state.used_capacity),
+    {_, PrevEstimate} = hd(State#state.estimated_capacity_history),
+    UsedCapacity = State#state.used_capacity,
 
-    UsedMoreThanEstimated = PrevUsedCapacity >= PrevEstimatedCapacity,
-    HadOverload = proplists:get_value(PrevT, State#state.overload_history, 0) > 0,
+    UsedMoreThanEstimated = UsedCapacity >= PrevEstimate,
+    HadOverload = State#state.overload > 0,
 
     case {UsedMoreThanEstimated, HadOverload} of
-        {true, false} ->
-            {PrevUsedCapacity, State};
-        {true, true} ->
-            {PrevUsedCapacity * 0.90, State};
-        {_, true} ->
-            {PrevEstimatedCapacity * 0.90, State};
-        {false, false} ->
-            {PrevUsedCapacity * 1.05, State}
+        {true, false}  -> UsedCapacity;
+        {true, true}   -> UsedCapacity * 0.90;
+        {_, true}      -> PrevEstimate * 0.90;
+        {false, false} -> UsedCapacity * 1.05
     end.
