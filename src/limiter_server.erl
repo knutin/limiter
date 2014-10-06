@@ -137,8 +137,6 @@ handle_call({set_ts, Ts}, _From, State) ->
     {reply, ok, State#state{current_ts = Ts}};
 
 handle_call({force_plan, NewTs}, _From, State) ->
-    ets:insert(mocked_time, {time, NewTs}),
-    NewTs = edatetime:now2ts(),
     {reply, ok, spawn_workers(plan(State#state{current_ts = NewTs}))};
 
 handle_call(get_tokens, _From, State) ->

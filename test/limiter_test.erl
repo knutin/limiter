@@ -77,25 +77,28 @@ simulation() ->
     Parent = self(),
 
 
-    Resource = spawn_link(fun () -> resource_loop(lists:duplicate(60, 100),
+    Resource = spawn_link(fun () -> resource_loop(lists:duplicate(30, 100) ++
+                                                      lists:duplicate(30, 50),
                                                   0, Parent) end),
 
 
-    %% 100 clients hammering the resource
-    spawn(fun () ->
-                  simulate_clients(200, 10000, {Limiter, Resource, 10, 0,
-                                                10000, 10000}),
-                  Parent ! simulation_done
-          end),
-
+    Do = fun (Units) ->
+                 limiter:do(Limiter, {use_resource, Resource, Units, 0},
+                            1000, 1000)
+         end,
 
     lists:map(fun (T) ->
-                      receive {Resource, empty} -> ok end,
-                      ok = limiter_server:force_plan(Limiter, T)
-                      %%ok = set_time(T)
-              end, lists:seq(1, 60)),
-    %%receive simulation_done -> ok end,
+                      Do(50),
+                      Do(45),
+                      Do(randrange(5)),
+                      Do(randrange(5)),
+                      Do(randrange(5)),
 
+                      ok = set_time(T),
+                      receive resource_shifting -> ok end,
+                      ok = limiter_server:force_plan(Limiter, T)
+
+              end, lists:seq(1, 60)),
 
     History = limiter_server:get_history(Limiter),
     error_logger:info_msg("~p~n", [History]),
@@ -146,20 +149,39 @@ resource_loop([Units | UnitSeries], Ts, Parent) ->
     resource_loop(UnitSeries, Ts, Units, Parent).
 
 resource_loop(UnitSeries, Ts, UnitsLeft, Parent) ->
-    receive
-        {do_work, From, UnitsToUse, Sleep} ->
-            NewUnitsLeft = UnitsLeft - UnitsToUse,
-            case NewUnitsLeft >= 0 of
-                true ->
-                    timer:sleep(Sleep),
-                    From ! {self(), {ok, {used_capacity, UnitsToUse}}},
-                    %%error_logger:info_msg("units ~p~n", [NewUnitsLeft]),
-                    resource_loop(UnitSeries, Ts, NewUnitsLeft, Parent);
-                false ->
-                    From ! {self(), {error, overload}},
-                    Parent ! {self(), empty},
-                    error_logger:info_msg("wait for refill~n"),
-                    wait_for_refill(UnitSeries, Ts, Parent)
+    case edatetime:now2ts() =:= Ts of
+        true ->
+            receive
+                {do_work, From, UnitsToUse, Sleep} ->
+                    NewUnitsLeft = UnitsLeft - UnitsToUse,
+
+                    case NewUnitsLeft >= 0 of
+                        true ->
+                            timer:sleep(Sleep),
+                            From ! {self(), {ok, {used_capacity, UnitsToUse}}},
+                            error_logger:info_msg("units ~p, used: ~p~n",
+                                                  [NewUnitsLeft, UnitsToUse]),
+                            resource_loop(UnitSeries, Ts, NewUnitsLeft, Parent);
+                        false ->
+                            From ! {self(), {error, overload}},
+                            %%Parent ! {self(), empty},
+                            %%error_logger:info_msg("wait for refill~n"),
+                            %%wait_for_refill(UnitSeries, Ts, Parent)
+                            resource_loop(UnitSeries, Ts, UnitsLeft, Parent)
+                    end
+            after 0 ->
+                    resource_loop(UnitSeries, Ts, UnitsLeft, Parent)
+            end;
+        false ->
+            Parent ! resource_shifting,
+            error_logger:info_msg("resource shifting time, new_t=~p~n",
+                                  [edatetime:now2ts()]),
+            case UnitSeries of
+                [Units | Rest] ->
+                    resource_loop(Rest, edatetime:now2ts(), Units, Parent);
+                [] ->
+                    Parent ! resource_done,
+                    ok
             end
     end.
 
@@ -210,3 +232,6 @@ set_time(T) ->
     ets:insert(mocked_time, {time, T}),
     T = edatetime:now2ts(),
     ok.
+
+randrange(Range) ->
+    random:uniform(Range).
